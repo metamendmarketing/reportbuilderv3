@@ -3,88 +3,7 @@ import email.utils
 from typing import Dict, Optional, List, Tuple, Any
 
 import streamlit as st
-import os
-import re
-import asyncio
-import sys
-import subprocess
-
-# Playwright on Windows needs ProactorEventLoopPolicy for subprocess support.
-if os.name == "nt":
-    try:
-        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-    except Exception:
-        pass
 from openai import OpenAI
-
-# Optional PDF export via Playwright (Chromium print-to-PDF).
-# Safe: if Playwright/Chromium isn't available, the app still runs and PDF button can be hidden/disabled.
-PLAYWRIGHT_AVAILABLE = True
-try:
-    from playwright.sync_api import sync_playwright
-except Exception:
-    PLAYWRIGHT_AVAILABLE = False
-
-_PW_BOOTSTRAPPED = False
-
-def ensure_playwright_chromium() -> None:
-    """Best-effort Chromium install for Streamlit Cloud/container environments."""
-    global _PW_BOOTSTRAPPED
-    if _PW_BOOTSTRAPPED:
-        return
-    _PW_BOOTSTRAPPED = True  # default to one-shot
-
-    # Don't run this bootstrap on Windows/local dev.
-    if os.name == "nt":
-        return
-    if not PLAYWRIGHT_AVAILABLE:
-        return
-
-    # Heuristic: run only in cloud/container contexts (Streamlit Cloud sets one of these in practice).
-    in_cloud = bool(
-        os.environ.get("STREAMLIT_CLOUD")
-        or os.environ.get("STREAMLIT_SHARING")
-        or os.environ.get("STREAMLIT_RUNTIME_ENV")
-        or os.environ.get("STREAMLIT_DEPLOYMENT")
-        or os.environ.get("STREAMLIT_SERVER_HEADLESS")
-        or os.environ.get("K_REVISION")      # Cloud Run
-        or os.environ.get("RENDER")          # Render.com
-        or os.environ.get("FLY_APP_NAME")    # Fly.io
-        or os.environ.get("ENABLE_PLAYWRIGHT_BOOTSTRAP") == "1"
-    )
-    if not in_cloud:
-        return
-
-    try:
-        subprocess.run(
-            [sys.executable, "-m", "playwright", "install", "chromium"],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    except Exception:
-        pass
-
-def html_to_pdf_bytes(html: str) -> bytes:
-    """Render the given HTML in headless Chromium and return PDF bytes."""
-    if not PLAYWRIGHT_AVAILABLE:
-        raise RuntimeError("Playwright is not available.")
-    ensure_playwright_chromium()
-
-    html = html or ""
-    with sync_playwright() as p:
-        browser = p.chromium.launch()
-        page = browser.new_page(viewport={"width": 1100, "height": 1400})
-        page.set_content(html, wait_until="networkidle")
-        pdf_bytes = page.pdf(
-            format="Letter",
-            print_background=True,
-            margin={"top": "0.75in", "bottom": "0.75in", "left": "0.75in", "right": "0.75in"},
-        )
-        browser.close()
-        return pdf_bytes
-
-
 
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -548,19 +467,6 @@ with st.expander("Edit sections", expanded=True):
     st.divider()
     st.subheader("Export")
 
-# Filenames (computed locally to avoid Streamlit rerun scope issues)
-_client_name_for_files = (st.session_state.get("client_name") or "").strip()
-_safe_client_name = re.sub(r"[^A-Za-z0-9]+", "", _client_name_for_files) or "monthly"
-
-_month_label_for_files = (st.session_state.get("month_label") or "").strip()
-_safe_month_label = re.sub(r"\s+", "-", _month_label_for_files)
-_safe_month_label = re.sub(r"[^A-Za-z0-9\-]+", "", _safe_month_label) or "Month"
-
-eml_filename = f"{_safe_client_name}-seo-update.eml"
-pdf_filename = f"{_safe_client_name}-Monthly-SEO-Report-{_safe_month_label}.pdf"
-
-    template = load_template()
-
     def _lines(s: str) -> List[str]:
         return [x.strip() for x in (s or "").splitlines() if x.strip()]
 
@@ -625,27 +531,9 @@ pdf_filename = f"{_safe_client_name}-Monthly-SEO-Report-{_safe_month_label}.pdf"
 
 
     st.download_button("Download HTML", data=html_out.encode("utf-8"), file_name="monthly_seo_update.html", mime="text/html")
-    
-col_eml, col_pdf = st.columns(2)
-with col_eml:
     st.download_button("Download .eml (Outlook-ready)", data=eml_bytes, file_name="monthly_seo_update.eml", mime="message/rfc822")
-    
-        
 
-with col_pdf:
-    if PLAYWRIGHT_AVAILABLE:
-        try:
-            pdf_bytes = html_to_pdf_bytes(preview_html)
-            st.download_button(
-                "Download PDF",
-                data=pdf_bytes,
-                file_name=pdf_filename,
-                mime="application/pdf",
-            )
-        except Exception as _pdf_exc:
-            st.caption(f"PDF export unavailable: {_pdf_exc}")
-    else:
-        st.caption("PDF export unavailable (Playwright not installed).")with st.expander("Preview HTML"):
+    with st.expander("Preview HTML"):
         st.components.v1.html(preview_html, height=600, scrolling=True)
 
     with st.expander("Copy/paste HTML (optional)"):
