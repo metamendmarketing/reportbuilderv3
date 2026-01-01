@@ -3,31 +3,11 @@ import sys, subprocess, asyncio
 import email.utils
 from typing import Dict, Optional, List, Tuple, Any
 
-# --- Optional parsing dependencies (graceful fallback if missing) ---
-try:
-    import pandas as pd
-except Exception:
-    pd = None
-
-try:
-    import pdfplumber
-except Exception:
-    pdfplumber = None
-
-try:
-    from PyPDF2 import PdfReader
-except Exception:
-    PdfReader = None
-
-try:
-    import docx as docx_lib
-except Exception:
-    docx_lib = None
-
 import streamlit as st
 
 # Use a repo-local Playwright browser cache (works on Streamlit Cloud)
-os.environ.setdefault('PLAYWRIGHT_BROWSERS_PATH', os.path.join(os.getcwd(), '.cache', 'ms-playwright'))
+if os.name != 'nt':
+    os.environ.setdefault('PLAYWRIGHT_BROWSERS_PATH', os.path.join(os.getcwd(), '.cache', 'ms-playwright'))
 
 import re
 import os
@@ -88,9 +68,25 @@ def html_to_pdf_bytes(html: str) -> bytes:
         raise RuntimeError("Playwright is not available.")
     html = html or ""
 
+    # Ensure Chromium is installed (handles fresh local envs and Streamlit Cloud rebuilds)
+    try:
+        ensure_playwright_chromium(force=False)
+    except Exception:
+        pass
+
     def _render_once() -> bytes:
         with sync_playwright() as p:
-            browser = p.chromium.launch(args=["--no-sandbox", "--disable-dev-shm-usage"])
+            try:
+                browser = p.chromium.launch(args=["--no-sandbox", "--disable-dev-shm-usage"])
+            except Exception as e:
+                if "Executable doesn't exist" in str(e) or "playwright install" in str(e):
+                    try:
+                        ensure_playwright_chromium(force=True)
+                    except Exception:
+                        pass
+                    browser = p.chromium.launch(args=["--no-sandbox", "--disable-dev-shm-usage"])
+                else:
+                    raise
             page = browser.new_page(viewport={"width": 1100, "height": 1400})
             page.set_content(html, wait_until="networkidle")
             pdf_bytes = page.pdf(
@@ -451,6 +447,316 @@ def get_api_key() -> Optional[str]:
     v = (os.getenv("OPENAI_API_KEY") or "").strip()
     return v or None
 
+
+# -----------------------------
+# Evidence extraction (Two-pass)
+# -----------------------------
+# This app uses a two-step process:
+# 1) Evidence extraction: parse uploads + produce a structured, high-confidence evidence summary.
+# 2) Writing: generate the email draft using Omni notes as primary narrative + the evidence summary as support.
+
+MAX_SUPPORTING_TEXT_CHARS = 180_000
+MAX_DOC_CHARS_PER_FILE = 60_000
+MAX_TABLE_ROWS = 80
+MAX_TABLE_COLS = 50
+
+def _safe_decode_text(b: bytes) -> str:
+    for enc in ("utf-8", "utf-16", "latin-1"):
+        try:
+            return b.decode(enc)
+        except Exception:
+            continue
+    return b.decode("utf-8", errors="ignore")
+
+def _normalize_ws(s: str) -> str:
+    s = (s or "").replace("\r\n", "\n").replace("\r", "\n")
+    s = re.sub(r"[ \t]+\n", "\n", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
+
+def _clamp(s: str, n: int) -> str:
+    if not s:
+        return ""
+    return s if len(s) <= n else (s[:n] + "\n\n[TRUNCATED]")
+
+def _extract_pdf_text(data: bytes) -> str:
+    # Prefer pdfplumber; fall back to PyPDF2.
+    try:
+        import pdfplumber  # type: ignore
+        parts = []
+        with pdfplumber.open(io.BytesIO(data)) as pdf:
+            for p_i, page in enumerate(pdf.pages):
+                t = (page.extract_text() or "").strip()
+                if t:
+                    parts.append(f"[PDF page {p_i+1}]\n{t}")
+        return _normalize_ws("\n\n".join(parts))
+    except Exception:
+        pass
+    try:
+        from PyPDF2 import PdfReader  # type: ignore
+        parts = []
+        reader = PdfReader(io.BytesIO(data))
+        for p_i, page in enumerate(reader.pages):
+            t = (page.extract_text() or "").strip()
+            if t:
+                parts.append(f"[PDF page {p_i+1}]\n{t}")
+        return _normalize_ws("\n\n".join(parts))
+    except Exception:
+        return ""
+
+def _extract_docx_text(data: bytes) -> str:
+    try:
+        import docx  # type: ignore
+        d = docx.Document(io.BytesIO(data))
+        paras = [p.text for p in d.paragraphs if (p.text or "").strip()]
+        return _normalize_ws("\n".join(paras))
+    except Exception:
+        return ""
+
+def _df_preview(df) -> Dict[str, Any]:
+    try:
+        import pandas as pd  # type: ignore
+        df2 = df.copy()
+        if df2.shape[1] > MAX_TABLE_COLS:
+            df2 = df2.iloc[:, :MAX_TABLE_COLS]
+        truncated = df2.shape[0] > MAX_TABLE_ROWS
+        dfp = df2.head(MAX_TABLE_ROWS) if truncated else df2
+        headers = [str(c) for c in dfp.columns.tolist()]
+        rows = dfp.fillna("").astype(str).values.tolist()
+        # light numeric stats for hinting
+        numeric_cols = [c for c in df2.columns if pd.api.types.is_numeric_dtype(df2[c])]
+        stats = {}
+        for c in numeric_cols[:12]:
+            col = df2[c].dropna()
+            if len(col) == 0:
+                continue
+            stats[str(c)] = {"min": float(col.min()), "max": float(col.max()), "mean": float(col.mean())}
+        return {
+            "shape": [int(df.shape[0]), int(df.shape[1])],
+            "headers": headers,
+            "rows": rows,
+            "truncated": bool(truncated),
+            "numeric_stats": stats,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+def build_supporting_context(uploaded_files: List[Any]) -> Dict[str, Any]:
+    """Parse non-image uploads into structured evidence for the model."""
+    supporting: Dict[str, Any] = {"documents": [], "tables": [], "notes": []}
+    total_chars = 0
+
+    # Lazy availability checks
+    has_pandas = True
+    has_pdfplumber = True
+    has_pypdf2 = True
+    has_docx = True
+    try:
+        import pandas  # noqa
+    except Exception:
+        has_pandas = False
+    try:
+        import pdfplumber  # noqa
+    except Exception:
+        has_pdfplumber = False
+    try:
+        import PyPDF2  # noqa
+    except Exception:
+        has_pypdf2 = False
+    try:
+        import docx  # noqa
+    except Exception:
+        has_docx = False
+
+    for f in uploaded_files or []:
+        name = getattr(f, "name", "uploaded_file")
+        lower = name.lower()
+        data = f.getvalue() if hasattr(f, "getvalue") else f.read()
+
+        # Skip images here
+        if lower.endswith((".png", ".jpg", ".jpeg", ".webp")):
+            continue
+
+        if lower.endswith(".pdf"):
+            t = _extract_pdf_text(data)
+            if t.strip():
+                t = _clamp(t, MAX_DOC_CHARS_PER_FILE)
+                supporting["documents"].append({"filename": name, "type": "pdf", "text": t})
+                total_chars += len(t)
+            else:
+                supporting["notes"].append(f"Could not extract text from PDF: {name}")
+            continue
+
+        if lower.endswith(".docx"):
+            t = _extract_docx_text(data)
+            if t.strip():
+                t = _clamp(t, MAX_DOC_CHARS_PER_FILE)
+                supporting["documents"].append({"filename": name, "type": "docx", "text": t})
+                total_chars += len(t)
+            else:
+                supporting["notes"].append(f"Could not extract text from DOCX: {name}")
+            continue
+
+        if lower.endswith((".txt", ".md", ".log")):
+            t = _normalize_ws(_safe_decode_text(data))
+            if t.strip():
+                t = _clamp(t, MAX_DOC_CHARS_PER_FILE)
+                supporting["documents"].append({"filename": name, "type": "text", "text": t})
+                total_chars += len(t)
+            continue
+
+        if lower.endswith((".xlsx", ".xls", ".xlsm")):
+            if not has_pandas:
+                supporting["notes"].append(f"Cannot parse Excel (pandas/openpyxl not installed): {name}")
+                continue
+            try:
+                import pandas as pd  # type: ignore
+                bio = io.BytesIO(data)
+                xl = pd.ExcelFile(bio, engine="openpyxl")
+                for sheet in xl.sheet_names[:12]:
+                    df = xl.parse(sheet_name=sheet)
+                    supporting["tables"].append({"filename": name, "type": "xlsx", "sheet": sheet, "table": _df_preview(df)})
+            except Exception as e:
+                supporting["notes"].append(f"Excel parse error for {name}: {e}")
+            continue
+
+        if lower.endswith(".csv"):
+            if not has_pandas:
+                supporting["notes"].append(f"Cannot parse CSV (pandas not installed): {name}")
+                continue
+            try:
+                import pandas as pd  # type: ignore
+                df = pd.read_csv(io.BytesIO(data))
+                supporting["tables"].append({"filename": name, "type": "csv", "table": _df_preview(df)})
+            except Exception as e:
+                supporting["notes"].append(f"CSV parse error for {name}: {e}")
+            continue
+
+        supporting["notes"].append(f"Unsupported file type for parsing: {name}")
+
+        if total_chars > MAX_SUPPORTING_TEXT_CHARS:
+            supporting["notes"].append("Supporting context truncated due to size limits.")
+            break
+
+    supporting["_extraction_stats"] = {
+        "documents_count": len(supporting.get("documents", [])),
+        "tables_count": len(supporting.get("tables", [])),
+        "notes_count": len(supporting.get("notes", [])),
+        "has_pandas": has_pandas,
+        "has_pdfplumber": has_pdfplumber,
+        "has_pypdf2": has_pypdf2,
+        "has_docx": has_docx,
+    }
+    return supporting
+
+EVIDENCE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "main_kpis": {"type": "array", "items": {"type": "object", "properties": {
+            "metric": {"type": "string"},
+            "value": {"type": "string"},
+            "delta": {"type": "string"},
+            "period": {"type": "string"},
+            "evidence_ref": {"type": "string"},
+            "confidence": {"type": "string"},
+        }, "required": ["metric","value","evidence_ref","confidence"], "additionalProperties": False}},
+        "noteworthy_wins": {"type": "array", "items": {"type": "object", "properties": {
+            "claim": {"type": "string"},
+            "why_it_matters": {"type": "string"},
+            "evidence_ref": {"type": "string"},
+            "confidence": {"type": "string"},
+        }, "required": ["claim","evidence_ref","confidence"], "additionalProperties": False}},
+        "risks_or_anomalies": {"type": "array", "items": {"type": "object", "properties": {
+            "claim": {"type": "string"},
+            "context": {"type": "string"},
+            "evidence_ref": {"type": "string"},
+            "confidence": {"type": "string"},
+        }, "required": ["claim","evidence_ref","confidence"], "additionalProperties": False}},
+        "movers": {"type": "array", "items": {"type": "object", "properties": {
+            "entity_type": {"type": "string"},  # page|query
+            "entity": {"type": "string"},
+            "movement": {"type": "string"},
+            "evidence_ref": {"type": "string"},
+            "confidence": {"type": "string"},
+        }, "required": ["entity_type","entity","evidence_ref","confidence"], "additionalProperties": False}},
+        "work_to_results_links": {"type": "array", "items": {"type": "object", "properties": {
+            "work_item": {"type": "string"},
+            "observed_signal": {"type": "string"},
+            "language": {"type": "string"},  # suggested cautious phrasing
+            "evidence_ref": {"type": "string"},
+            "confidence": {"type": "string"},
+        }, "required": ["work_item","observed_signal","evidence_ref","confidence"], "additionalProperties": False}},
+        "notes": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["main_kpis","noteworthy_wins","risks_or_anomalies","movers","work_to_results_links","notes"],
+    "additionalProperties": False,
+}
+
+EVIDENCE_SYSTEM_PROMPT = """You are a meticulous SEO analyst.
+Task: Extract HIGH-CONFIDENCE evidence from supporting_context (documents/tables) and provided screenshots.
+Return ONLY JSON matching the schema.
+
+Rules:
+- Be comprehensive: attempt to pull the most important KPIs and notable changes.
+- Only include claims you can ground in evidence. Every item MUST include evidence_ref pointing to filename and page/sheet when possible.
+- Confidence must be one of: High, Medium, Low. Prefer High only when numbers/labels are explicit.
+- Do not editorialize. Do not write an email. Do not mention limitations like 'in this workspace'.""".strip()
+
+def run_evidence_extraction(client: OpenAI, model: str, omni_notes: str, supporting_context: Dict[str, Any], image_parts_for_model: List[Tuple[str, bytes, str]]) -> Dict[str, Any]:
+    supporting_json = json.dumps(supporting_context, ensure_ascii=False)
+    user_text = f"""Omni notes (for context only; do not invent results):
+{omni_notes}
+
+Supporting context (parsed from uploads):
+{supporting_json}
+
+Now extract evidence per schema.""".strip()
+
+    content = [{"type": "input_text", "text": user_text}]
+    # Attach images (downscaled already elsewhere) for extraction
+    for name, b, mt in image_parts_for_model:
+        b64 = base64.b64encode(b).decode("utf-8")
+        content.append({"type": "input_image", "image_url": f"data:{mt};base64,{b64}"})
+        content.append({"type": "input_text", "text": f"Image filename: {name}"})
+
+        # Call the model. Some OpenAI SDK versions do not support `response_format=` for responses.create.
+    # We therefore ask for strict JSON in the prompt and then parse best-effort.
+    try:
+        resp = client.responses.create(
+            model=model,
+            input=[
+                {"role": "system", "content": EVIDENCE_SYSTEM_PROMPT},
+                {"role": "user", "content": content},
+            ],
+        )
+    except TypeError:
+        resp = client.responses.create(
+            model=model,
+            input=[
+                {"role": "system", "content": EVIDENCE_SYSTEM_PROMPT},
+                {"role": "user", "content": content},
+            ],
+        )
+
+    raw = getattr(resp, "output_text", "") or ""
+    if not raw:
+        return {"main_kpis": [], "noteworthy_signals": {"positive": [], "negative": [], "neutral": []},
+                "page_movers": [], "query_movers": [], "work_to_results_links": [], "notes": ["No output_text"]}
+
+    # Best-effort JSON extraction
+    m = re.search(r"\{[\s\S]*\}", raw)
+    if not m:
+        return {"main_kpis": [], "noteworthy_signals": {"positive": [], "negative": [], "neutral": []},
+                "page_movers": [], "query_movers": [], "work_to_results_links": [], "notes": ["No JSON found in output"]}
+
+    try:
+        return json.loads(m.group(0))
+    except Exception:
+        return {"main_kpis": [], "noteworthy_signals": {"positive": [], "negative": [], "neutral": []},
+                "page_movers": [], "query_movers": [], "work_to_results_links": [], "notes": ["JSON parse failed"]}
+
+
+
 def load_template() -> str:
     """Load HTML template from disk; fall back to embedded template on failure."""
     try:
@@ -463,173 +769,6 @@ TEMPLATE_HTML = load_template()
 
 def html_escape(s: str) -> str:
     return (s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
-
-# --- Supporting context extraction (PDF/DOCX/TXT/XLSX/CSV) ---
-MAX_SUPPORTING_TEXT_CHARS = 180_000
-MAX_TABLE_ROWS_PREVIEW = 40
-MAX_TABLE_COLS_PREVIEW = 30
-
-def _safe_decode_text(data: bytes) -> str:
-    for enc in ("utf-8", "utf-16", "latin-1"):
-        try:
-            return data.decode(enc)
-        except Exception:
-            continue
-    return data.decode("utf-8", errors="ignore")
-
-def _normalize_ws(s: str) -> str:
-    s = (s or "").replace("\r\n", "\n").replace("\r", "\n")
-    s = re.sub(r"[ \t]+\n", "\n", s)
-    s = re.sub(r"\n{3,}", "\n\n", s)
-    return s.strip()
-
-def _clamp_text(s: str, max_chars: int) -> str:
-    s = s or ""
-    if len(s) <= max_chars:
-        return s
-    return s[:max_chars] + "\n\n[TRUNCATED]"
-
-def _extract_pdf_text(file_bytes: bytes) -> str:
-    parts = []
-    if pdfplumber is not None:
-        try:
-            import io as _io
-            with pdfplumber.open(_io.BytesIO(file_bytes)) as pdf:
-                for i, page in enumerate(pdf.pages):
-                    t = page.extract_text() or ""
-                    if t.strip():
-                        parts.append(f"[PDF page {i+1}]\n{t}")
-            return _normalize_ws("\n\n".join(parts))
-        except Exception:
-            pass
-    if PdfReader is not None:
-        try:
-            import io as _io
-            reader = PdfReader(_io.BytesIO(file_bytes))
-            for i, page in enumerate(reader.pages):
-                t = page.extract_text() or ""
-                if t.strip():
-                    parts.append(f"[PDF page {i+1}]\n{t}")
-            return _normalize_ws("\n\n".join(parts))
-        except Exception:
-            return ""
-    return ""
-
-def _extract_docx_text(file_bytes: bytes) -> str:
-    if docx_lib is None:
-        return ""
-    try:
-        import io as _io
-        doc = docx_lib.Document(_io.BytesIO(file_bytes))
-        paras = [p.text for p in doc.paragraphs if (p.text or "").strip()]
-        return _normalize_ws("\n".join(paras))
-    except Exception:
-        return ""
-
-def _df_preview(df):
-    if pd is None:
-        return {"error": "pandas not installed"}
-    try:
-        df2 = df.copy()
-        if df2.shape[1] > MAX_TABLE_COLS_PREVIEW:
-            df2 = df2.iloc[:, :MAX_TABLE_COLS_PREVIEW]
-        truncated = df2.shape[0] > MAX_TABLE_ROWS_PREVIEW
-        df_preview = df2.head(MAX_TABLE_ROWS_PREVIEW) if truncated else df2
-        headers = [str(h) for h in df_preview.columns.tolist()]
-        rows = df_preview.fillna("").astype(str).values.tolist()
-        stats = {}
-        numeric_cols = [c for c in df2.columns if pd.api.types.is_numeric_dtype(df2[c])]
-        for c in numeric_cols[:12]:
-            col = df2[c].dropna()
-            if len(col) == 0:
-                continue
-            stats[str(c)] = {"min": float(col.min()), "max": float(col.max()), "mean": float(col.mean())}
-        return {"shape": [int(df.shape[0]), int(df.shape[1])], "headers": headers, "rows": rows, "truncated": truncated, "numeric_stats": stats}
-    except Exception as e:
-        return {"error": str(e)}
-
-def build_supporting_context(files) -> dict:
-    """
-    Extract evidence from non-image uploads into a structured supporting_context.
-    Images are still analyzed via vision (sent separately); this context is for PDFs/docs/sheets/text.
-    """
-    import os as _os
-    import io as _io
-    import mimetypes as _mimetypes
-
-    supporting = {"documents": [], "tables": [], "notes": []}
-    total_chars = 0
-
-    for f in (files or []):
-        name = getattr(f, "name", "uploaded_file")
-        ext = (_os.path.splitext(name)[1] or "").lower()
-        mime = getattr(f, "type", None) or _mimetypes.guess_type(name)[0] or "application/octet-stream"
-        b = f.getvalue()
-
-        # Skip images here (they go through synthesis_images)
-        if mime.startswith("image/") or ext in (".png", ".jpg", ".jpeg"):
-            continue
-
-        if mime == "application/pdf" or ext == ".pdf":
-            t = _extract_pdf_text(b)
-            t = _clamp_text(t, 40_000)
-            total_chars += len(t)
-            if t.strip():
-                supporting["documents"].append({"filename": name, "type": "pdf", "text": t})
-            else:
-                supporting["notes"].append(f"Could not extract text from PDF: {name}")
-            continue
-
-        if ext == ".docx" or mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
-            t = _extract_docx_text(b)
-            t = _clamp_text(t, 40_000)
-            total_chars += len(t)
-            if t.strip():
-                supporting["documents"].append({"filename": name, "type": "docx", "text": t})
-            else:
-                supporting["notes"].append(f"Could not extract text from DOCX: {name}")
-            continue
-
-        if mime.startswith("text/") or ext in (".txt", ".md", ".log"):
-            t = _normalize_ws(_safe_decode_text(b))
-            t = _clamp_text(t, 40_000)
-            total_chars += len(t)
-            if t.strip():
-                supporting["documents"].append({"filename": name, "type": "text", "text": t})
-            continue
-
-        if ext in (".xlsx", ".xls", ".xlsm") or mime in ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "application/vnd.ms-excel"):
-            if pd is None:
-                supporting["notes"].append(f"Skipped spreadsheet (pandas not installed): {name}")
-                continue
-            try:
-                bio = _io.BytesIO(b)
-                xl = pd.ExcelFile(bio, engine="openpyxl")
-                for sheet in xl.sheet_names[:10]:
-                    df = xl.parse(sheet_name=sheet)
-                    supporting["tables"].append({"filename": name, "type": "xlsx", "sheet": sheet, "table": _df_preview(df)})
-            except Exception as e:
-                supporting["notes"].append(f"Failed to parse spreadsheet {name}: {e}")
-            continue
-
-        if ext == ".csv" or mime in ("text/csv", "application/csv"):
-            if pd is None:
-                supporting["notes"].append(f"Skipped CSV (pandas not installed): {name}")
-                continue
-            try:
-                df = pd.read_csv(_io.BytesIO(b))
-                supporting["tables"].append({"filename": name, "type": "csv", "table": _df_preview(df)})
-            except Exception as e:
-                supporting["notes"].append(f"Failed to parse CSV {name}: {e}")
-            continue
-
-        supporting["notes"].append(f"Unsupported file type for parsing: {name} ({mime})")
-
-        if total_chars > MAX_SUPPORTING_TEXT_CHARS:
-            supporting["notes"].append("Supporting context truncated due to size limits.")
-            break
-
-    return supporting
 
 def bullets_to_html(items: List[str]) -> str:
     items = [i.strip() for i in (items or []) if i and i.strip()]
@@ -695,8 +834,8 @@ def gpt_generate_email(client: OpenAI, model: str, payload: dict, synthesis_imag
         schema = {
             "subject": "string",
             "monthly_overview": "2-3 sentences (max)",
+            "main_kpis": ["0-5 bullets (only if truly noteworthy; otherwise empty list)"],
             "key_highlights": ["3-4 bullets (max)"],
-            "main_kpis": ["3-6 bullets (max)"],
             "wins_progress": ["2-3 bullets (max)"],
             "blockers": ["1-3 bullets (max)"],
             "completed_tasks": ["3-5 bullets (max)"],
@@ -708,6 +847,7 @@ def gpt_generate_email(client: OpenAI, model: str, payload: dict, synthesis_imag
         schema = {
             "subject": "string",
             "monthly_overview": "3-4 sentences (max)",
+            "main_kpis": ["0-7 bullets (only if truly noteworthy; otherwise empty list)"],
             "key_highlights": ["4-6 bullets (max)"],
             "wins_progress": ["3-6 bullets (max)"],
             "blockers": ["2-5 bullets (max)"],
@@ -721,8 +861,8 @@ def gpt_generate_email(client: OpenAI, model: str, payload: dict, synthesis_imag
         schema = {
             "subject": "string",
             "monthly_overview": "3-4 sentences (max)",
+            "main_kpis": ["0-7 bullets (only if truly noteworthy; otherwise empty list)"],
             "key_highlights": ["3-5 bullets (max)"],
-            "main_kpis": ["3-8 bullets (max)"],
             "wins_progress": ["3-5 bullets (max)"],
             "blockers": ["2-4 bullets (max)"],
             "completed_tasks": ["4-8 bullets (max)"],
@@ -749,10 +889,14 @@ Examples of preferred language style:
 - “We updated internal linking to support…”
 
 Content rules:
-- Use Omni notes as the source of truth for work completed, in-progress work, blockers, and context.
-- Do NOT invent metrics, results, or causality. If impact obviously correlates to work completed or insights gained from screenshots mention it, otherwise say nothing about it.
-- If uploaded screenshots show explicit labels, numbers, or statuses, reference them to provide context, observations or an insight, if there is a direct correlation between results or work completed mention it.
-- Avoid repeating exact date ranges. Prefer language like “this month, in December we, during the period”.
+- Omni notes are the PRIMARY source of truth for what work happened, what is in progress, what is blocked, and what is planned.
+- Evidence (supporting_context + evidence_analysis) is SECONDARY and should be used sparingly to add value.
+- Do NOT invent metrics, results, or causality. Only include numbers that appear in evidence_analysis/supporting_context.
+- Keep the Monthly Overview very close to the Omni notes wording/intent. Only add ONE short performance/result sentence if there is an obvious, high-confidence win or risk.
+- Put KPI numbers in the Main KPIs section (main_kpis) whenever possible. Avoid repeating the same numbers across multiple sections.
+- Use evidence in Key Highlights/Wins only when it is truly noteworthy (material up/down, clear mover, or directly supports the work narrative). Otherwise, keep those sections focused on the work summary.
+- If evidence suggests a relationship between work and results, use cautious language (e.g., "early signal", "may be contributing") unless explicitly stated.
+- Never output limitation text like “couldn’t pull KPIs / in this workspace”. If evidence is missing, omit.
 
 Verbosity control:
 Adjust wording based on CONTEXT.verbosity_level. Do NOT add new sections in any mode.
@@ -961,6 +1105,7 @@ def _normalize_email_json(data: dict, verbosity_level: str) -> dict:
 
     if v.startswith("quick"):
         data["monthly_overview"] = limit_sentences(data.get("monthly_overview", ""), 3)
+        limit_list("main_kpis", 5)
         limit_list("key_highlights", 4)
         limit_list("wins_progress", 3)
         limit_list("blockers", 3)
@@ -972,6 +1117,7 @@ def _normalize_email_json(data: dict, verbosity_level: str) -> dict:
             data["image_captions"] = caps[:1]
     elif v.startswith("standard"):
         data["monthly_overview"] = limit_sentences(data.get("monthly_overview", ""), 4)
+        limit_list("main_kpis", 7)
         limit_list("key_highlights", 5)
         limit_list("wins_progress", 5)
         limit_list("blockers", 4)
@@ -979,6 +1125,7 @@ def _normalize_email_json(data: dict, verbosity_level: str) -> dict:
         limit_list("outstanding_tasks", 8)
     else:  # deep dive
         data["monthly_overview"] = limit_sentences(data.get("monthly_overview", ""), 4)
+        limit_list("main_kpis", 7)
         limit_list("key_highlights", 6)
         limit_list("wins_progress", 6)
         limit_list("blockers", 5)
@@ -994,14 +1141,29 @@ def _normalize_email_json(data: dict, verbosity_level: str) -> dict:
 if st.button("Generate Email Draft", type="primary", disabled=not can_generate, use_container_width=True):
     client = OpenAI(api_key=api_key)
 
-    # Synthesis images (only images are sent to the model)
+    # Collect images (sent to the model) + image triplets (for evidence extraction with filenames)
     synthesis_images: List[bytes] = []
+    image_triplets: List[Tuple[str, bytes, str]] = []  # (filename, bytes, mime)
     for f in (uploaded or []):
-        if f.name.lower().endswith((".png", ".jpg", ".jpeg")):
-            synthesis_images.append(f.getvalue())
+        fn = f.name
+        low = fn.lower()
+        if low.endswith((".png", ".jpg", ".jpeg")):
+            b = f.getvalue()
+            synthesis_images.append(b)
+            mime = "image/png" if low.endswith(".png") else "image/jpeg"
+            image_triplets.append((fn, b, mime))
 
-    # Supporting context (under-the-hood parsing of non-image uploads)
-    supporting_context = build_supporting_context(uploaded or [])
+    # Parse documents/spreadsheets into supporting_context
+    with st.spinner("Analyzing data..."):
+        supporting_context = build_supporting_context(uploaded or [])
+        evidence_analysis = run_evidence_extraction(
+            client=client,
+            model=model,
+            omni_notes=st.session_state.omni_notes_pasted.strip(),
+            supporting_context=supporting_context,
+            image_parts_for_model=image_triplets,
+        )
+        st.session_state.evidence_analysis = evidence_analysis
 
     payload = {
         "client_name": st.session_state.client_name.strip(),
@@ -1012,15 +1174,17 @@ if st.button("Generate Email Draft", type="primary", disabled=not can_generate, 
         "verbosity_level": st.session_state.get("verbosity_level", "Quick scan"),
         "uploaded_files": [f.name for f in (uploaded or [])],
         "supporting_context": supporting_context,
+        "evidence_analysis": evidence_analysis,
     }
 
-    with st.spinner("Drafting email..."):
+    with st.spinner("Writing email draft..."):
         data, raw = gpt_generate_email(client, model, payload, synthesis_images)
         data = _normalize_email_json(data if isinstance(data, dict) else {}, payload["verbosity_level"])
         st.session_state.email_json = data
         st.session_state.raw = raw
 
     # Seed image assignment/captions suggestions
+
     for item in (st.session_state.email_json.get("image_captions") or []):
         fn = (item.get("file_name") or "").strip()
         if fn:
@@ -1035,7 +1199,7 @@ if st.button("Generate Email Draft", type="primary", disabled=not can_generate, 
 for _f in st.session_state.uploaded_files:
     if _f.name.lower().endswith((".png",".jpg",".jpeg")):
         _fn = _f.name
-        if st.session_state.image_assignments.get(_fn) not in {"key_highlights","wins_progress","blockers","completed_tasks","outstanding_tasks"}:
+        if st.session_state.image_assignments.get(_fn) not in {"key_highlights","main_kpis","wins_progress","blockers","completed_tasks","outstanding_tasks"}:
             st.session_state.image_assignments[_fn] = "key_highlights"
         st.session_state.image_captions.setdefault(_fn, "")
 
@@ -1052,7 +1216,7 @@ monthly_overview = st.text_area("Monthly overview", value=data.get("monthly_over
 
 with st.expander("Edit sections", expanded=True):
     key_highlights = st.text_area("Key highlights (one per line)", value="\n".join(data.get("key_highlights") or []), height=150)
-    main_kpis = st.text_area("Main KPIs (one per line)", value="\n".join(data.get("main_kpis") or []), height=140)
+    main_kpis = st.text_area("Main KPI's (one per line) — optional", value="\n".join(data.get("main_kpis") or []), height=140)
     wins_progress = st.text_area("Wins & progress (one per line)", value="\n".join(data.get("wins_progress") or []), height=170)
     blockers = st.text_area("Blockers / risks (one per line)", value="\n".join(data.get("blockers") or []), height=140)
     completed_tasks = st.text_area("Completed tasks (one per line)", value="\n".join(data.get("completed_tasks") or []), height=170)
@@ -1093,14 +1257,14 @@ with st.expander("Edit sections", expanded=True):
         return [x.strip() for x in (s or "").splitlines() if x.strip()]
 
     highlights_list = _lines(key_highlights)
-    kpis_list = _lines(main_kpis)
+    main_kpis_list = _lines(main_kpis)
     wins_list = _lines(wins_progress)
     blockers_list = _lines(blockers)
     completed_list = _lines(completed_tasks)
     outstanding_list = _lines(outstanding_tasks)
 
     sec_high = section_block("Key highlights", bullets_to_html(highlights_list))
-    sec_kpis = section_block("Main KPIs", bullets_to_html(kpis_list))
+    sec_kpis = section_block("Main KPI\'s", bullets_to_html(main_kpis_list))
     sec_wins = section_block("Wins & progress", bullets_to_html(wins_list))
     sec_blk = section_block("Blockers / risks", bullets_to_html(blockers_list))
     sec_done = section_block("Completed tasks", bullets_to_html(completed_list))
