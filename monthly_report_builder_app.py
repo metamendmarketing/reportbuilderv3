@@ -716,9 +716,10 @@ Now extract evidence per schema.""".strip()
     content = [{"type": "input_text", "text": user_text}]
     # Attach images (downscaled already elsewhere) for extraction
     for name, b, mt in image_parts_for_model:
+        # Provide filename BEFORE the image so the model can reliably map file_name -> image.
+        content.append({"type": "input_text", "text": f"Image filename: {name}"})
         b64 = base64.b64encode(b).decode("utf-8")
         content.append({"type": "input_image", "image_url": f"data:{mt};base64,{b64}"})
-        content.append({"type": "input_text", "text": f"Image filename: {name}"})
 
         # Call the model. Some OpenAI SDK versions do not support `response_format=` for responses.create.
     # We therefore ask for strict JSON in the prompt and then parse best-effort.
@@ -827,7 +828,7 @@ def build_eml(subject: str, html_body: str, images: List[Tuple[str, bytes]]) -> 
     BytesGenerator(buf, policy=policy.default).flatten(msg)
     return buf.getvalue()
 
-def gpt_generate_email(client: OpenAI, model: str, payload: dict, synthesis_images: List[bytes]) -> Tuple[dict, str]:
+def gpt_generate_email(client: OpenAI, model: str, payload: dict, image_triplets: List[Tuple[str, bytes, str]]) -> Tuple[dict, str]:
     # Keep the same section structure across modes. The ONLY thing that changes by verbosity
     # is how much context is included within the same sections.
     v = (payload.get("verbosity_level") or "Quick scan").strip().lower()
@@ -841,7 +842,7 @@ def gpt_generate_email(client: OpenAI, model: str, payload: dict, synthesis_imag
             "blockers": ["1-3 bullets (max)"],
             "completed_tasks": ["3-5 bullets (max)"],
             "outstanding_tasks": ["3-5 bullets (max)"],
-            "image_captions": [{"file_name":"exact filename","caption":"optional","suggested_section":"wins_progress|key_highlights|blockers|completed_tasks|outstanding_tasks"}],
+            "image_captions": [{"file_name":"exact filename","caption":"optional","suggested_section":"main_kpis|wins_progress|key_highlights|blockers|completed_tasks|outstanding_tasks"}],
             "dashthis_line": "short 1 sentence"
         }
     elif v.startswith("deep"):
@@ -854,7 +855,7 @@ def gpt_generate_email(client: OpenAI, model: str, payload: dict, synthesis_imag
             "blockers": ["2-5 bullets (max)"],
             "completed_tasks": ["5-10 bullets (max)"],
             "outstanding_tasks": ["5-10 bullets (max)"],
-            "image_captions": [{"file_name":"exact filename","caption":"optional","suggested_section":"wins_progress|key_highlights|blockers|completed_tasks|outstanding_tasks"}],
+            "image_captions": [{"file_name":"exact filename","caption":"optional","suggested_section":"main_kpis|wins_progress|key_highlights|blockers|completed_tasks|outstanding_tasks"}],
             "dashthis_line": "1-2 sentences (max)"
         }
     else:
@@ -868,7 +869,7 @@ def gpt_generate_email(client: OpenAI, model: str, payload: dict, synthesis_imag
             "blockers": ["2-4 bullets (max)"],
             "completed_tasks": ["4-8 bullets (max)"],
             "outstanding_tasks": ["4-8 bullets (max)"],
-            "image_captions": [{"file_name":"exact filename","caption":"optional","suggested_section":"wins_progress|key_highlights|blockers|completed_tasks|outstanding_tasks"}],
+            "image_captions": [{"file_name":"exact filename","caption":"optional","suggested_section":"main_kpis|wins_progress|key_highlights|blockers|completed_tasks|outstanding_tasks"}],
             "dashthis_line": "1 sentence"
         }
 
@@ -899,6 +900,11 @@ Content rules:
 - If evidence suggests a relationship between work and results, use cautious language (e.g., "early signal", "may be contributing") unless explicitly stated.
 - Never output limitation text like “couldn’t pull KPIs / in this workspace”. If evidence is missing, omit.
 
+Screenshot-to-section association:
+- If you reference or summarize insight from a screenshot in any section, you MUST assign that screenshot to the SAME section via image_captions[].suggested_section.
+- If screenshots show GSC page/query movers (tables of URLs/queries with click gains), include 1 bullet in Wins & progress summarizing 2–4 examples (brief), and assign those screenshots to wins_progress with a short caption that names examples.
+- If a screenshot is a KPI trend chart or KPI tiles, assign it to main_kpis.
+
 Verbosity control:
 Adjust wording based on CONTEXT.verbosity_level. Do NOT add new sections in any mode.
 - Quick scan (default): ultra brief and scannable.
@@ -924,8 +930,10 @@ Output requirements:
     )
 
     content = [{"type":"input_text","text":prompt}]
-    for im in synthesis_images:
-        content.append({"type":"input_image","image_url":"data:image/png;base64," + base64.b64encode(im).decode()})
+    # Attach screenshots with filenames so the model can reliably map file_name -> image.
+    for fn, b, mt in (image_triplets or []):
+        content.append({"type":"input_text","text": f"Screenshot filename: {fn}"})
+        content.append({"type":"input_image","image_url": f"data:{mt};base64," + base64.b64encode(b).decode("utf-8")})
 
     resp = client.responses.create(
         model=model,
@@ -1115,7 +1123,7 @@ def _normalize_email_json(data: dict, verbosity_level: str) -> dict:
         # Keep screenshots light in quick-scan mode.
         caps = data.get("image_captions") or []
         if isinstance(caps, list):
-            data["image_captions"] = caps[:1]
+            data["image_captions"] = caps[:10]
     elif v.startswith("standard"):
         data["monthly_overview"] = limit_sentences(data.get("monthly_overview", ""), 4)
         limit_list("main_kpis", 7)
@@ -1140,6 +1148,11 @@ def _normalize_email_json(data: dict, verbosity_level: str) -> dict:
 
 
 if st.button("Generate Email Draft", type="primary", disabled=not can_generate, use_container_width=True):
+
+    # Reset screenshot placement/captions each time we generate a new draft
+    st.session_state.image_assignments = {}
+    st.session_state.image_captions = {}
+
     client = OpenAI(api_key=api_key)
 
     # Collect images (sent to the model) + image triplets (for evidence extraction with filenames)
@@ -1179,7 +1192,7 @@ if st.button("Generate Email Draft", type="primary", disabled=not can_generate, 
     }
 
     with st.spinner("Writing email draft..."):
-        data, raw = gpt_generate_email(client, model, payload, synthesis_images)
+        data, raw = gpt_generate_email(client, model, payload, image_triplets)
         data = _normalize_email_json(data if isinstance(data, dict) else {}, payload["verbosity_level"])
         st.session_state.email_json = data
         st.session_state.raw = raw
