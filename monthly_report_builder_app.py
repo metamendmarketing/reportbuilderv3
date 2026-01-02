@@ -123,15 +123,16 @@ from email.mime.image import MIMEImage
 from email.generator import BytesGenerator
 from email import policy
 
-APP_TITLE = "Metamend Monthly SEO Email Builder"
+APP_TITLE = "Metamend - Monthly SEO Report Builder"
 DEFAULT_MODEL = "gpt-5.2"
 
 # Canned opening lines (used by the Opening line suggestions)
 CANNED_OPENERS = [
-    "Hope you’re doing well — please see your monthly SEO status update below.",
+    "Hope you’re doing well! Please see your monthly SEO status update below.",
     "Sharing this month’s SEO update below, including the key wins, opportunities, and next steps.",
-    "Here’s your monthly SEO progress update — we’ve highlighted what moved, what it means, and what we’re prioritizing next.",
+    "Here’s your monthly SEO progress update - we’ve highlighted what moved, what it means, and what we’re prioritizing next.",
     "Below is the monthly SEO status update for {month_label}.",
+    "Hope you had an enjoyable weekend! Please see your monthly SEO status update below.",
     "Hope you’re having a great holiday season — please see your monthly SEO status update below.",
 ]
 
@@ -1215,12 +1216,12 @@ subject = st.text_input("Subject", value=data.get("subject", ""))
 monthly_overview = st.text_area("Monthly overview", value=data.get("monthly_overview", ""), height=120)
 
 with st.expander("Edit sections", expanded=True):
-    key_highlights = st.text_area("Key highlights (one per line)", value="\n".join(data.get("key_highlights") or []), height=150)
-    main_kpis = st.text_area("Main KPI's (one per line) — optional", value="\n".join(data.get("main_kpis") or []), height=140)
-    wins_progress = st.text_area("Wins & progress (one per line)", value="\n".join(data.get("wins_progress") or []), height=170)
-    blockers = st.text_area("Blockers / risks (one per line)", value="\n".join(data.get("blockers") or []), height=140)
-    completed_tasks = st.text_area("Completed tasks (one per line)", value="\n".join(data.get("completed_tasks") or []), height=170)
-    outstanding_tasks = st.text_area("Outstanding tasks (one per line)", value="\n".join(data.get("outstanding_tasks") or []), height=170)
+    key_highlights = st.text_area("Key highlights", value="\n".join(data.get("key_highlights") or []), height=150)
+    main_kpis = st.text_area("Main KPI's", value="\n".join(data.get("main_kpis") or []), height=140)
+    wins_progress = st.text_area("Wins & progress", value="\n".join(data.get("wins_progress") or []), height=170)
+    blockers = st.text_area("Blockers / risks", value="\n".join(data.get("blockers") or []), height=140)
+    completed_tasks = st.text_area("Completed tasks", value="\n".join(data.get("completed_tasks") or []), height=170)
+    outstanding_tasks = st.text_area("Outstanding tasks", value="\n".join(data.get("outstanding_tasks") or []), height=170)
     dashthis_line = st.text_area("DashThis line", value=data.get("dashthis_line", ""), height=70)
 
     st.divider()
